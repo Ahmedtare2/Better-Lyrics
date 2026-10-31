@@ -74,8 +74,26 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== Repository top level ==="; ls -la
-          settings="$(find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) \
-                      -not -path './.git/*' | head -n1)"
+          find_settings() {
+            find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path './.git/*' | head -n1
+          }
+          settings="$(find_settings)"
+
+          # The repo may only contain the project as a .zip (uploaded without extracting): unpack it.
+          if [[ -z "$settings" ]]; then
+            for z in ./*.zip; do
+              [[ -f "$z" ]] || continue
+              if unzip -l "$z" | grep -qE '[ /]settings\.gradle(\.kts)?$'; then
+                echo "Extracting project from $z"
+                mkdir -p _src
+                unzip -q -o "$z" -d _src
+                break
+              fi
+            done
+            settings="$(find_settings)"
+          fi
+
           if [[ -z "$settings" ]]; then
             echo "::error::No settings.gradle(.kts) found. The project files were not uploaded to this repo. Tree:"
             find . -maxdepth 3 -not -path './.git/*' | sort | head -80
