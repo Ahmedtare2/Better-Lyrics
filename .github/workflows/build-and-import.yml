@@ -206,13 +206,45 @@ jobs:
               os.remove(source)
           PY
           fi
+          # Small optional files: the upstream repos may not publish meta.json, so try the
+          # download once and otherwise generate it from the vocab (what the app reads).
+          cat > "$RUNNER_TEMP/mkmeta.py" <<'PY'
+          import json, sys
+          vocab = json.load(open(sys.argv[1], encoding="utf-8"))
+          if isinstance(vocab.get("vocab"), dict):
+              vocab = vocab["vocab"]
+          blank = next((vocab[t] for t in ("<pad>", "[PAD]") if t in vocab), 0)
+          delim = next((t for t in ("|", " ") if t in vocab), "|")
+          json.dump({"blank_id": blank, "word_delimiter_token": delim,
+                     "generated_by": "build workflow"}, open(sys.argv[2], "w"))
+          print(f"generated {sys.argv[2]}: blank_id={blank} delimiter={delim!r}")
+          PY
+          optional() {  # <file> <url>
+            local f="$MODEL_DIR/$1"
+            [[ -s "$f" ]] && return 0
+            if curl --fail --silent --location --connect-timeout 30 --max-time 120 -o "$f.part" "$2"; then
+              mv "$f.part" "$f"
+            else
+              rm -f "$f.part"; return 1
+            fi
+          }
+          ensure_meta() {  # <lang> <repo> <rev>
+            optional "meta_$1.json" "$(hf "$2" "$3" meta.json)" && return 0
+            echo "No upstream meta.json for $1 - generating from vocab"
+            python3 "$RUNNER_TEMP/mkmeta.py" "$MODEL_DIR/vocab_$1.json" "$MODEL_DIR/meta_$1.json"
+          }
+
           fetch vocab_ar.json "$(hf "$AR_REPO" "$AR_REV" vocab.json)" - 16
-          fetch meta_ar.json  "$(hf "$AR_REPO" "$AR_REV" meta.json)"  - 16
+          ensure_meta ar "$AR_REPO" "$AR_REV"
 
           # English model (pre-quantized)
-          fetch ctc_en.onnx   "$(hf "$EN_REPO" "$EN_REV" onnx/model_quantized.onnx)" "$EN_SHA" 50000000
-          fetch vocab_en.json "$(hf "$EN_REPO" "$EN_REV" vocab.json)" - 16
-          fetch meta_en.json  "$(hf "$EN_REPO" "$EN_REV" meta.json)"  - 16
+          fetch ctc_en.onnx "$(hf "$EN_REPO" "$EN_REV" onnx/model_quantized.onnx)" "$EN_SHA" 50000000
+          if ! optional vocab_en.json "$(hf "$EN_REPO" "$EN_REV" vocab.json)"; then
+            echo "::warning::No vocab.json upstream for English - writing the standard wav2vec2-base-960h vocab"
+            echo '{"<pad>":0,"<s>":1,"</s>":2,"<unk>":3,"|":4,"E":5,"T":6,"A":7,"O":8,"N":9,"I":10,"H":11,"S":12,"R":13,"D":14,"L":15,"U":16,"M":17,"W":18,"C":19,"F":20,"G":21,"Y":22,"P":23,"B":24,"V":25,"K":26,"'"'"'":27,"X":28,"J":29,"Q":30,"Z":31}' \
+              > "$MODEL_DIR/vocab_en.json"
+          fi
+          ensure_meta en "$EN_REPO" "$EN_REV"
 
           # HTDemucs (FP16)
           fetch htdemucs_fp16.onnx "$(hf "$DEMUCS_REPO" "$DEMUCS_REV" htdemucs_fp16weights.onnx)" "$DEMUCS_SHA" 100000000
