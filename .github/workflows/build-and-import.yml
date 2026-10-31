@@ -67,12 +67,32 @@ jobs:
 
       - name: Set up Gradle (with cache)
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
-      - name: Prepare Gradle wrapper
+      - name: Locate project and prepare Gradle wrapper
         run: |
-          # Files uploaded through the GitHub website lose the executable bit.
+          set -euo pipefail
+          echo "=== Repository top level ==="; ls -la
+          settings="$(find . -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) \
+                      -not -path './.git/*' | head -n1)"
+          if [[ -z "$settings" ]]; then
+            echo "::error::No settings.gradle(.kts) found. The project files were not uploaded to this repo. Tree:"
+            find . -maxdepth 3 -not -path './.git/*' | sort | head -80
+            exit 1
+          fi
+          proj="$(cd "$(dirname "$settings")" && pwd)"
+          echo "Project directory: $proj"
+          echo "PROJECT_DIR=$proj" >> "$GITHUB_ENV"
+          cd "$proj"
+          test -d app || { echo "::error::No app/ module in $proj"; exit 1; }
+
+          # Website uploads lose the executable bit, and may skip gradlew / the wrapper jar.
+          if [[ ! -f gradlew || ! -s gradle/wrapper/gradle-wrapper.jar ]]; then
+            echo "Wrapper missing - regenerating with Gradle 8.7"
+            gradle wrapper --gradle-version 8.7
+          fi
           chmod +x ./gradlew
-          test -s gradle/wrapper/gradle-wrapper.jar
           ./gradlew --version
 
       # ───────────── Models ─────────────
@@ -80,7 +100,7 @@ jobs:
         if: ${{ inputs.model_zip_url == '' }}
         uses: actions/cache@v4
         with:
-          path: app/src/main/assets/models
+          path: ${{ env.PROJECT_DIR }}/app/src/main/assets/models
           key: models-${{ hashFiles('.github/workflows/build-and-import.yml') }}
 
       - name: Import models from ZIP (optional)
@@ -89,6 +109,7 @@ jobs:
           ZIP_URL: ${{ inputs.model_zip_url }}
         run: |
           set -euo pipefail
+          cd "$PROJECT_DIR"
           mkdir -p "$MODEL_DIR"
           tmp="$(mktemp -d)"
           curl -L --fail --retry 3 --retry-delay 5 -o "$tmp/models.zip" "$ZIP_URL"
@@ -124,6 +145,7 @@ jobs:
       - name: Download any missing models (pinned and checksum-verified)
         run: |
           set -euo pipefail
+          cd "$PROJECT_DIR"
           mkdir -p "$MODEL_DIR"
 
           fetch() {  # fetch <file> <url> <sha256|-> <min_bytes>
@@ -180,7 +202,7 @@ jobs:
       - name: Verify model assets
         run: |
           set -euo pipefail
-          cd "$MODEL_DIR"
+          cd "$PROJECT_DIR/$MODEL_DIR"
 
           check_model() {  # <file> <min_bytes>
             [[ -s "$1" ]] || { echo "::error::Missing model $1"; exit 1; }
@@ -249,12 +271,14 @@ jobs:
       - name: Unit tests + lint
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_checks }}
         continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
         run: ./gradlew :app:testDebugUnitTest :app:lintDebug --stacktrace
 
       # ───────────── Build ONE APK ─────────────
       - name: Build APK
         env:
           MODE: ${{ steps.signing.outputs.mode }}
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
           if [[ "$MODE" == "release" ]]; then task=assembleRelease; else task=assembleDebug; fi
@@ -270,7 +294,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: BetterLyrics-${{ steps.signing.outputs.mode }}-${{ github.run_number }}
-          path: dist/*.apk
+          path: ${{ env.PROJECT_DIR }}/dist/*.apk
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
