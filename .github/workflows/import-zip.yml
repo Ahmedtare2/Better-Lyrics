@@ -1,0 +1,101 @@
+
+name: Import Android Project ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Better-Lyrics-GitHub-Ready.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  import-project:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract and validate project ZIP
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          import shutil
+
+          archive = Path("Better-Lyrics-GitHub-Ready.zip")
+          root = Path.cwd().resolve()
+
+          if not archive.is_file():
+              raise SystemExit("Project ZIP was not found.")
+
+          required = [
+              "gradlew",
+              "gradle/wrapper/gradle-wrapper.jar",
+              "gradle/wrapper/gradle-wrapper.properties",
+              "app/build.gradle.kts",
+              ".github/workflows/build-apk.yml",
+          ]
+
+          with ZipFile(archive) as z:
+              names = set()
+
+              for info in z.infolist():
+                  name = info.filename
+
+                  if "\\" in name:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+
+                  path = PurePosixPath(name)
+
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+
+                  if not path.parts:
+                      continue
+
+                  if path.parts[0] == ".git":
+                      raise SystemExit("ZIP must not contain Git metadata.")
+
+                  if info.external_attr >> 28 == 0xA:
+                      raise SystemExit(f"Symbolic links are not allowed: {name}")
+
+                  names.add(name.rstrip("/"))
+
+              missing = [f for f in required if f not in names]
+              if missing:
+                  raise SystemExit("Missing project files: " + ", ".join(missing))
+
+              for info in z.infolist():
+                  if info.is_dir():
+                      continue
+
+                  target = (root / info.filename).resolve()
+
+                  if not target.is_relative_to(root):
+                      raise SystemExit(f"Unsafe extraction target: {info.filename}")
+
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with z.open(info) as source, target.open("wb") as output:
+                      shutil.copyfileobj(source, output)
+
+          print("Project ZIP extracted and validated successfully.")
+          PY
+
+      - name: Remove uploaded ZIP
+        run: rm -f Better-Lyrics-GitHub-Ready.zip
+
+      - name: Commit extracted project
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Import Better Lyrics Android project"
+            git push
+          else
+            echo "No project changes to commit."
+          fi
