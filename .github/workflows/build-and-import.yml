@@ -1,0 +1,269 @@
+name: Build APK (with optional model import)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      model_zip_path:
+        description: "Path to model assets ZIP (aligner-ar/, aligner-en/, optional htdemucs/)"
+        required: false
+        type: string
+      model_zip_url:
+        description: "HTTPS URL to download model assets ZIP"
+        required: false
+        type: string
+      skip_model_import:
+        description: "Skip model import, use only CI-downloaded models"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      # ─── Checkout ───
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      # ─── JDK + Android SDK ───
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          yes | sdkmanager --licenses >/dev/null
+
+      - name: Verify Gradle wrapper
+        run: |
+          test -x ./gradlew
+          test -s gradle/wrapper/gradle-wrapper.jar
+          grep -q 'distributionSha256Sum=544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d' gradle/wrapper/gradle-wrapper.properties
+          ./gradlew --version
+
+      # ─── Optional: Import models from ZIP ───
+      - name: Import model assets from ZIP (if provided)
+        if: ${{ inputs.model_zip_path != '' || inputs.model_zip_url != '' }}
+        id: import_models
+        run: |
+          set -euo pipefail
+          
+          ZIP_PATH="${{ inputs.model_zip_path }}"
+          ZIP_URL="${{ inputs.model_zip_url }}"
+          TARGET_DIR="app/src/main/assets/models"
+          CONVERT_TO_CI=true
+          
+          mkdir -p "$TARGET_DIR"
+          
+          # Download ZIP if URL provided
+          if [[ -n "$ZIP_URL" ]]; then
+            echo "Downloading model ZIP from $ZIP_URL"
+            curl -L --fail --retry 3 --retry-delay 5 -o models.zip "$ZIP_URL"
+            ZIP_PATH="models.zip"
+          fi
+          
+          if [[ ! -f "$ZIP_PATH" ]]; then
+            echo "Model ZIP not found: $ZIP_PATH"
+            exit 1
+          fi
+          
+          echo "=== ZIP contents ==="
+          unzip -l "$ZIP_PATH"
+          
+          # Extract to temp
+          TMPDIR=$(mktemp -d)
+          unzip -q "$ZIP_PATH" -d "$TMPDIR"
+          
+          # Detect format
+          FOUND_PHONE=false
+          FOUND_CI=false
+          
+          if [[ -f "$TMPDIR/aligner-ar/model.int8.onnx" || -f "$TMPDIR/aligner-ar/model.onnx" ]] && \
+             [[ -f "$TMPDIR/aligner-ar/vocab.json" ]] && \
+             [[ -f "$TMPDIR/aligner-ar/meta.json" ]]; then
+            FOUND_PHONE=true
+            echo "Detected phone format: aligner-ar/"
+          fi
+          
+          if [[ -f "$TMPDIR/aligner-en/model.int8.onnx" || -f "$TMPDIR/aligner-en/model.onnx" ]] && \
+             [[ -f "$TMPDIR/aligner-en/vocab.json" ]] && \
+             [[ -f "$TMPDIR/aligner-en/meta.json" ]]; then
+            FOUND_PHONE=true
+            echo "Detected phone format: aligner-en/"
+          fi
+          
+          if [[ -f "$TMPDIR/ctc_ar.onnx" && -f "$TMPDIR/ctc_en.onnx" && \
+                -f "$TMPDIR/vocab_ar.json" && -f "$TMPDIR/vocab_en.json" && \
+                -f "$TMPDIR/meta_ar.json" && -f "$TMPDIR/meta_en.json" ]]; then
+            FOUND_CI=true
+            echo "Detected CI format"
+          fi
+          
+          if [[ "$FOUND_PHONE" != "true" && "$FOUND_CI" != "true" ]]; then
+            echo "::error::No recognized model structure in ZIP"
+            exit 1
+          fi
+          
+          # Validate phone format
+          if [[ "$FOUND_PHONE" == "true" ]]; then
+            for model in aligner-ar aligner-en; do
+              if [[ -f "$TMPDIR/$model/vocab.json" ]]; then
+                python3 -c "
+import json
+with open('$TMPDIR/$model/vocab.json') as f:
+    vocab = json.load(f)
+assert isinstance(vocab, dict) and vocab, 'vocab must be non-empty dict'
+print(f'$model/vocab.json: {len(vocab)} tokens')
+"
+              fi
+              if [[ -f "$TMPDIR/$model/meta.json" ]]; then
+                python3 -c "
+import json
+with open('$TMPDIR/$model/meta.json') as f:
+    meta = json.load(f)
+assert isinstance(meta, dict) and meta, 'meta must be non-empty dict'
+assert 'blank_id' in meta, 'meta missing blank_id'
+assert 'word_delimiter_token' in meta, 'meta missing word_delimiter_token'
+print(f'$model/meta.json: blank_id={meta[\"blank_id\"]}, delim={meta[\"word_delimiter_token\"]}')
+"
+              fi
+            done
+          fi
+          
+          # Convert phone → CI format
+          if [[ "$CONVERT_TO_CI" == "true" && "$FOUND_PHONE" == "true" ]]; then
+            CI_DIR="${TMPDIR}_ci"
+            mkdir -p "$CI_DIR"
+            
+            # Arabic
+            if [[ -f "$TMPDIR/aligner-ar/model.int8.onnx" ]]; then
+              cp "$TMPDIR/aligner-ar/model.int8.onnx" "$CI_DIR/ctc_ar.onnx"
+            elif [[ -f "$TMPDIR/aligner-ar/model.onnx" ]]; then
+              cp "$TMPDIR/aligner-ar/model.onnx" "$CI_DIR/ctc_ar.onnx"
+            fi
+            [[ -f "$TMPDIR/aligner-ar/vocab.json" ]] && cp "$TMPDIR/aligner-ar/vocab.json" "$CI_DIR/vocab_ar.json"
+            [[ -f "$TMPDIR/aligner-ar/meta.json" ]] && cp "$TMPDIR/aligner-ar/meta.json" "$CI_DIR/meta_ar.json"
+            
+            # English
+            if [[ -f "$TMPDIR/aligner-en/model.int8.onnx" ]]; then
+              cp "$TMPDIR/aligner-en/model.int8.onnx" "$CI_DIR/ctc_en.onnx"
+            elif [[ -f "$TMPDIR/aligner-en/model.onnx" ]]; then
+              cp "$TMPDIR/aligner-en/model.onnx" "$CI_DIR/ctc_en.onnx"
+            fi
+            [[ -f "$TMPDIR/aligner-en/vocab.json" ]] && cp "$TMPDIR/aligner-en/vocab.json" "$CI_DIR/vocab_en.json"
+            [[ -f "$TMPDIR/aligner-en/meta.json" ]] && cp "$TMPDIR/aligner-en/meta.json" "$CI_DIR/meta_en.json"
+            
+            # HTDemucs
+            if [[ -f "$TMPDIR/htdemucs/model.onnx" ]]; then
+              cp "$TMPDIR/htdemucs/model.onnx" "$CI_DIR/htdemucs_fp16.onnx"
+            elif [[ -f "$TMPDIR/htdemucs_fp16.onnx" ]]; then
+              cp "$TMPDIR/htdemucs_fp16.onnx" "$CI_DIR/htdemucs_fp16.onnx"
+            fi
+            
+            # Provenance
+            cat > "$CI_DIR/model-assets.properties" <<EOP
+imported_from_phone=true
+import_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+arabic.source=phone_aligner_ar
+english.source=phone_aligner_en
+EOP
+            (cd "$CI_DIR" && sha256sum *.onnx *.json 2>/dev/null > model-assets.sha256 || true)
+            
+            SOURCE_DIR="$CI_DIR"
+          else
+            SOURCE_DIR="$TMPDIR"
+          fi
+          
+          # Copy to target
+          cp -r "$SOURCE_DIR"/* "$TARGET_DIR/" 2>/dev/null || true
+          
+          # Preserve phone format for SAF import
+          if [[ "$FOUND_PHONE" == "true" ]]; then
+            for model in aligner-ar aligner-en; do
+              if [[ -d "$TMPDIR/$model" ]]; then
+                cp -r "$TMPDIR/$model" "$TARGET_DIR/"
+              fi
+            done
+          fi
+          
+          echo "=== Models in $TARGET_DIR ==="
+          find "$TARGET_DIR" -type f | sort
+          
+          echo "imported=true" >> "$GITHUB_OUTPUT"
+
+      # ─── Download CI models (if no ZIP import or incomplete) ───
+      - name: Download required bundled models (CI fallback)
+        if: ${{ steps.import_models.outputs.imported != 'true' || inputs.skip_model_import == 'true' }}
+        run: scripts/fetch-ci-models.sh
+
+      - name: Verify model assets before packaging
+        run: scripts/verify-model-assets.sh
+
+      # ─── Signing config ───
+      - name: Configure optional production signing
+        id: signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEYSTORE_PASSWORD" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" ]]; then
+            keystore="$RUNNER_TEMP/better-lyrics-release.keystore"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+            chmod 600 "$keystore"
+            echo "ANDROID_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+            echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "Production signing secrets configured."
+          else
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "No complete signing secret set found; release output will be unsigned."
+          fi
+
+      # ─── Test + Lint ───
+      - name: Run unit tests and static analysis
+        run: ./gradlew :app:testDebugUnitTest :app:lintDebug --no-daemon --stacktrace
+
+      # ─── Assemble APKs ───
+      - name: Assemble debug and release APKs
+        run: ./gradlew :app:assembleDebug :app:assembleRelease --no-daemon --stacktrace
+
+      # ─── Upload artifacts ───
+      - name: Upload debug APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: better-lyrics-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: better-lyrics-release-${{ steps.signing.outputs.mode }}-${{ github.run_number }}
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
